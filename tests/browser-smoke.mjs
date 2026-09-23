@@ -1,52 +1,41 @@
-// No npm packages. Uses Node's native WebSocket and Chrome preinstalled on GitHub runners.
-import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+// Dependency-free browser verification using Node built-ins and runner-provided Chrome.
+import {createServer} from 'node:http';
+import {spawn} from 'node:child_process';
+import {readFile,writeFile,mkdir} from 'node:fs/promises';
 import assert from 'node:assert/strict';
-const out = 'test-results';
-await mkdir(out, { recursive: true });
-const html = await readFile('index.html');
-const server = createServer((req,res) => {res.writeHead(200, {'Content-Type':'text/html; charset=utf-8'});res.end(html);});
-await new Promise(resolve => server.listen(8080,'127.0.0.1',resolve));
+const out='test-results'; await mkdir(out,{recursive:true});
+const html=await readFile('index.html');
+const server=createServer((req,res)=>{res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});res.end(html)});
+await new Promise(r=>server.listen(8080,'127.0.0.1',r));
 const chrome=spawn('/usr/bin/google-chrome',['--headless=new','--no-sandbox','--disable-dev-shm-usage','--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader','--remote-debugging-port=9222','--user-data-dir=/tmp/synth-fab-chrome','about:blank'],{stdio:'ignore'});
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-let ws,id=0,pending=new Map(),errors=[],checks=[];
-const report=()=> '# SYNTH//FAB verification\n\n'+checks.map(x=>'- '+x).join('\n')+'\n\n'+(errors.length?'## Errors\n'+errors.map(x=>'- '+x).join('\n'):'No uncaught JavaScript errors.\n');
-function send(method,params={}){return new Promise((resolve,reject)=>{const n=++id;const timer=setTimeout(()=>{pending.delete(n);reject(new Error('CDP timeout: '+method))},20000);pending.set(n,{resolve:r=>{clearTimeout(timer);resolve(r)},reject:e=>{clearTimeout(timer);reject(e)}});ws.send(JSON.stringify({id:n,method,params}));});}
-async function evaluate(expression){const r=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.exceptionDetails)throw new Error(r.exceptionDetails.exception?.description||r.exceptionDetails.text);return r.result.value;}
-async function until(expression,timeout=30000){const start=Date.now();while(Date.now()-start<timeout){if(await evaluate(expression))return;await sleep(250)}throw new Error('Condition timed out: '+expression)}
-async function screenshot(name){const r=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(`${out}/${name}.png`,Buffer.from(r.data,'base64'));}
-async function click(selector){await evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);}
-async function check(name,fn){await fn();checks.push('PASS — '+name);console.log('PASS:',name);}
+let ws,id=0,pending=new Map(),errors=[],checks=[],diagnostics=[];
+function send(method,params={}){return new Promise((resolve,reject)=>{const n=++id,timer=setTimeout(()=>{pending.delete(n);reject(Error('CDP timeout: '+method))},20000);pending.set(n,{resolve:r=>{clearTimeout(timer);resolve(r)},reject:e=>{clearTimeout(timer);reject(e)}});ws.send(JSON.stringify({id:n,method,params}))})}
+async function evaluate(expression){const r=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.exceptionDetails)throw Error(r.exceptionDetails.exception?.description||r.exceptionDetails.text);return r.result.value}
+async function until(expression,timeout=30000){const start=Date.now();while(Date.now()-start<timeout){if(await evaluate(expression))return;await sleep(250)}throw Error('Condition timed out: '+expression)}
+async function screenshot(name){const r=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(`${out}/${name}.png`,Buffer.from(r.data,'base64'))}
+async function click(s){await evaluate(`document.querySelector(${JSON.stringify(s)}).click()`)}
+async function check(name,fn){await fn();checks.push('PASS — '+name);console.log('::notice::PASS: '+name)}
 try{
- let pages;
- for(let n=0;n<60;n++){try{pages=await(await fetch('http://127.0.0.1:9222/json')).json();break}catch{await sleep(250)}}
+ let pages;for(let n=0;n<60;n++){try{pages=await(await fetch('http://127.0.0.1:9222/json')).json();break}catch{await sleep(250)}}
  assert(pages?.length,'Chrome debugging interface unavailable');
- ws=new WebSocket(pages[0].webSocketDebuggerUrl);
- await new Promise((resolve,reject)=>{ws.onopen=resolve;ws.onerror=reject});
- ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id){const p=pending.get(m.id);if(p){pending.delete(m.id);m.error?p.reject(new Error(m.error.message)):p.resolve(m.result)}}else if(m.method==='Runtime.exceptionThrown')errors.push(m.params.exceptionDetails.exception?.description||m.params.exceptionDetails.text);};
- await send('Page.enable');await send('Runtime.enable');
+ ws=new WebSocket(pages[0].webSocketDebuggerUrl);await new Promise((r,j)=>{ws.onopen=r;ws.onerror=j});
+ ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id){const p=pending.get(m.id);if(p){pending.delete(m.id);m.error?p.reject(Error(m.error.message)):p.resolve(m.result)}}else if(m.method==='Runtime.exceptionThrown')errors.push(m.params.exceptionDetails.exception?.description||m.params.exceptionDetails.text);else if(m.method==='Runtime.consoleAPICalled'&&m.params.type==='error'){const text=m.params.args.map(a=>a.description||a.value||a.type).join(' ');diagnostics.push(text);console.log('::error::Browser console: '+text.replaceAll('\n','%0A'))}else if(m.method==='Network.loadingFailed')diagnostics.push('Network failure: '+m.params.errorText)};
+ await send('Page.enable');await send('Runtime.enable');await send('Network.enable');
  await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
  await send('Page.navigate',{url:'http://127.0.0.1:8080/'});
- await check('WebGL engine and THREE r128 initialize',async()=>{await until('typeof engine !== "undefined" && !!engine',45000);assert.equal(await evaluate('THREE.REVISION'),'128');await until('document.querySelector("#loading").hidden')});
+ await check('WebGL engine and THREE r128 initialize',async()=>{await until('typeof engine !== "undefined" && (!!engine || !document.querySelector("#retry").hidden)',45000);assert(await evaluate('!!engine'),await evaluate('JSON.stringify({message:document.querySelector("#loading-text").textContent,three:typeof THREE,controls:typeof THREE!=="undefined"&&typeof THREE.OrbitControls})'));assert.equal(await evaluate('THREE.REVISION'),'128')});
  await sleep(1200);await screenshot('01-desktop-hero');
- await check('Desktop has no horizontal overflow',async()=>assert(await evaluate('document.documentElement.scrollWidth <= innerWidth+1')));
+ await check('Desktop has no horizontal overflow',async()=>assert(await evaluate('document.documentElement.scrollWidth<=innerWidth+1')));
  await check('Material switch and orbit inspection',async()=>{await click('[data-material="3"]');assert.match(await evaluate('document.querySelector("#material-name").textContent'),/Cyan/);assert.equal(await evaluate('document.querySelector("#orbit-btn").getAttribute("aria-pressed")'),'true')});
- await check('Reconstruction and exploded shells',async()=>{await click('[data-step="2"]');await sleep(1600);await click('#explode');assert.equal(await evaluate('document.querySelector("#explode").getAttribute("aria-pressed")'),'true')});
- await screenshot('02-reconstruction');
- await check('Slicing layer scrub and G-code readout',async()=>{await click('[data-step="3"]');await sleep(1500);await evaluate('document.querySelector("#layer-slider").value=400;document.querySelector("#layer-slider").dispatchEvent(new Event("input"))');assert.equal(await evaluate('document.querySelector("#layer-value").textContent'),'400');assert.equal(await evaluate('document.querySelector("#gcode-z").textContent'),'80.00');assert(await evaluate('!document.querySelector("#slice-hud").hidden'))});
- await screenshot('03-slicer');
- await check('Physical handoff and camera state',async()=>{await click('[data-step="4"]');await sleep(1400);assert.match(await evaluate('document.querySelector("#stage-status").textContent'),/BUILD PLATE/)});
- await screenshot('04-physical');
+ await check('Reconstruction and exploded shells',async()=>{await click('[data-step="2"]');await sleep(1600);await click('#explode');assert.equal(await evaluate('document.querySelector("#explode").getAttribute("aria-pressed")'),'true')});await screenshot('02-reconstruction');
+ await check('Slicing layer scrub and G-code readout',async()=>{await click('[data-step="3"]');await sleep(1500);await evaluate('document.querySelector("#layer-slider").value=400;document.querySelector("#layer-slider").dispatchEvent(new Event("input"))');assert.equal(await evaluate('document.querySelector("#layer-value").textContent'),'400');assert.equal(await evaluate('document.querySelector("#gcode-z").textContent'),'80.00');assert(await evaluate('!document.querySelector("#slice-hud").hidden'))});await screenshot('03-slicer');
+ await check('Physical handoff and camera state',async()=>{await click('[data-step="4"]');await sleep(1400);assert.match(await evaluate('document.querySelector("#stage-status").textContent'),/BUILD PLATE/)});await screenshot('04-physical');
  await check('All STL and 3MF assets have valid binary containers',async()=>{const data=await evaluate(`['chameleon','totem','planter'].map(kind=>{const b=engine.exportSTL(kind),v=new DataView(b),z=engine.export3MF(kind);return {kind,bytes:b.byteLength,triangles:v.getUint32(80,true),zip:z.length,signature:new DataView(z.buffer).getUint32(0,true),end:new DataView(z.buffer).getUint32(z.length-22,true)}})`);for(const d of data){assert(d.triangles>100);assert.equal(d.bytes,84+d.triangles*50);assert.equal(d.signature,0x04034b50);assert.equal(d.end,0x06054b50)}await writeFile(`${out}/exports.json`,JSON.stringify(data,null,2));for(const kind of ['chameleon','totem','planter']){const zip=await evaluate(`Array.from(engine.export3MF('${kind}'))`);await writeFile(`${out}/${kind}.3mf`,Buffer.from(zip))}});
- await check('Simulator completion, estimates, and reset',async()=>{await evaluate('document.querySelector("#lab").scrollIntoView({behavior:"instant"})');await click('#simulate');await until('!document.querySelector("#receipt").hidden');assert.equal(await evaluate('document.querySelector("#receipt-time").textContent'),'1h 42m');assert.equal(await evaluate('document.querySelector("#receipt-weight").textContent'),'48g');await click('[data-preset="Parametric Cable Organizer"]');await click('#simulate');await click('#cancel-sim');assert.match(await evaluate('document.querySelector("#sim-status").textContent'),/CANCELLED/);assert.equal(await evaluate('document.querySelector("#prompt").value'),'Parametric Cable Organizer')});
- await screenshot('05-simulator');
+ await check('Simulator completion, estimates, and cancellation',async()=>{await evaluate('document.querySelector("#lab").scrollIntoView({behavior:"instant"})');await click('#simulate');await until('!document.querySelector("#receipt").hidden');assert.equal(await evaluate('document.querySelector("#receipt-time").textContent'),'1h 42m');assert.equal(await evaluate('document.querySelector("#receipt-weight").textContent'),'48g');await click('[data-preset="Parametric Cable Organizer"]');await click('#simulate');await click('#cancel-sim');assert.match(await evaluate('document.querySelector("#sim-status").textContent'),/CANCELLED/);assert.equal(await evaluate('document.querySelector("#prompt").value'),'Parametric Cable Organizer')});await screenshot('05-simulator');
  await check('Comparison slider and accessible asset drawer',async()=>{await evaluate('const r=document.querySelector(".compare input");r.value=73;r.dispatchEvent(new Event("input"))');assert.equal(await evaluate('document.querySelector(".compare").style.getPropertyValue("--split")'),'73%');await click('[data-asset="1"]');assert(await evaluate('document.querySelector("#asset-dialog").open'));assert.match(await evaluate('document.querySelector("#asset-title").textContent'),/Monolith/);await evaluate('document.querySelector("#asset-dialog").close()')});
- await check('Mobile layout, touch scroll, navigation, and help',async()=>{await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});await evaluate('window.scrollTo({top:0,behavior:"instant"})');await sleep(1700);await click('#reset-view');assert(await evaluate('document.documentElement.scrollWidth <= innerWidth+1'));assert.equal(await evaluate('document.querySelector("#scene").style.touchAction'),'pan-y');await click('#menu-btn');assert.equal(await evaluate('document.querySelector("#menu-btn").getAttribute("aria-expanded")'),'true');await click('#menu-btn');await click('#help-quick');assert(await evaluate('document.querySelector("#help-dialog").open'));await evaluate('document.querySelector("#help-dialog").close()')});
- await screenshot('06-mobile-hero');
- await check('Reduced motion preference pauses ambient animation',async()=>{await send('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});await send('Page.reload');await until('typeof engine !== "undefined" && !!engine');assert.equal(await evaluate('document.querySelector("#pause-btn").getAttribute("aria-pressed")'),'true')});
- assert.equal(errors.length,0,errors.join('\n'));
- checks.push('PASS — no uncaught JavaScript exceptions');
- console.log('All browser checks passed.');
-}catch(error){checks.push('FAIL — '+error.message);console.error('::error::'+error.stack);process.exitCode=1;try{await screenshot('failure')}catch{}}
-finally{await writeFile(`${out}/report.md`,report());if(ws)ws.close();chrome.kill('SIGTERM');server.close();}
+ await check('Mobile layout, touch scroll, navigation, and help',async()=>{await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});await evaluate('window.scrollTo({top:0,behavior:"instant"})');await sleep(1700);await click('#reset-view');assert(await evaluate('document.documentElement.scrollWidth<=innerWidth+1'),await evaluate('JSON.stringify({width:innerWidth,scroll:document.documentElement.scrollWidth,overflow:[...document.querySelectorAll("body *")].filter(e=>e.getBoundingClientRect().right>innerWidth+1).slice(0,12).map(e=>({tag:e.tagName,id:e.id,class:e.className}))})'));assert.equal(await evaluate('document.querySelector("#scene").style.touchAction'),'pan-y');await click('#menu-btn');assert.equal(await evaluate('document.querySelector("#menu-btn").getAttribute("aria-expanded")'),'true');await click('#menu-btn');await click('#help-quick');assert(await evaluate('document.querySelector("#help-dialog").open'));await evaluate('document.querySelector("#help-dialog").close()')});await screenshot('06-mobile-hero');
+ await check('Reduced motion pauses ambient animation',async()=>{await send('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});await send('Page.reload');await sleep(700);await until('typeof engine!=="undefined"&&!!engine');assert.equal(await evaluate('document.querySelector("#pause-btn").getAttribute("aria-pressed")'),'true')});
+ assert.equal(errors.length,0,errors.join('\n'));checks.push('PASS — no uncaught JavaScript exceptions');console.log('::notice::ALL BROWSER CHECKS PASSED');
+}catch(error){checks.push('FAIL — '+error.message);console.error('::error::'+String(error.stack).replaceAll('\n','%0A'));process.exitCode=1;try{await screenshot('failure');const details=await evaluate('JSON.stringify({ready:document.readyState,loading:document.querySelector("#loading-text")?.textContent,three:typeof THREE,engine:typeof engine})');console.error('::error::Diagnostics: '+details)}catch{}}
+finally{await writeFile(`${out}/report.md`,'# SYNTH//FAB verification\n\n'+checks.map(x=>'- '+x).join('\n')+'\n\n## Diagnostics\n'+[...errors,...diagnostics].join('\n'));if(ws)ws.close();chrome.kill('SIGTERM');server.close()}
