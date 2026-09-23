@@ -1,0 +1,65 @@
+name: Verify and publish SYNTH FAB
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: synth-fab-pages
+  cancel-in-progress: true
+jobs:
+  verify:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[site]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate inline JavaScript
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          html = Path('index.html').read_text()
+          scripts = re.findall(r'<script(?:\s[^>]*)?>([\s\S]*?)</script>', html)
+          Path('/tmp/synth-fab-check.js').write_text('\n'.join(scripts))
+          assert 'SYNTH//FAB' in html
+          assert 'three@0.128.0' in html
+          PY
+          node --check /tmp/synth-fab-check.js
+      - name: Browser, responsive, interaction and export tests
+        run: node tests/browser-smoke.mjs
+      - name: Save verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synth-fab-verification
+          path: test-results/
+      - name: Publish verification summary
+        if: always()
+        run: cat test-results/report.md >> "$GITHUB_STEP_SUMMARY"
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Stage the single-file experience
+        run: |
+          mkdir _site
+          cp index.html _site/index.html
+          touch _site/.nojekyll
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
