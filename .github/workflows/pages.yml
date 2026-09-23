@@ -10,7 +10,6 @@ concurrency:
   cancel-in-progress: true
 jobs:
   verify:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[site]')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -29,6 +28,31 @@ jobs:
           node --check /tmp/synth-fab-check.js
       - name: Browser, responsive, interaction and export tests
         run: node tests/browser-smoke.mjs
+      - name: Independently validate 3MF archives and geometry references
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          from xml.etree import ElementTree as ET
+          ns = {'m':'http://schemas.microsoft.com/3dmanufacturing/core/2015/02'}
+          files = list(Path('test-results').glob('*.3mf'))
+          assert len(files) == 3
+          for path in files:
+              with ZipFile(path) as z:
+                  assert z.testzip() is None
+                  for name in ('[Content_Types].xml', '_rels/.rels', '3D/3dmodel.model'):
+                      ET.fromstring(z.read(name))
+                  root = ET.fromstring(z.read('3D/3dmodel.model'))
+                  assert root.attrib['unit'] == 'millimeter'
+                  vertices = root.findall('.//m:vertex', ns)
+                  triangles = root.findall('.//m:triangle', ns)
+                  assert vertices and triangles
+                  assert len(root.findall('.//m:base', ns)) == 4
+                  for t in triangles:
+                      assert all(0 <= int(t.attrib[k]) < len(vertices) for k in ('v1','v2','v3'))
+                      assert all(0 <= int(t.attrib[k]) < 4 for k in ('p1','p2','p3'))
+                  print(f'PASS: {path.name}: {len(vertices)} vertices, {len(triangles)} triangles, CRC and XML valid')
+          PY
       - name: Save verification evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -50,16 +74,40 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v6
+      - name: Check one-time Pages activation
+        id: activation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'JS'
+          import {appendFileSync} from 'node:fs';
+          const r = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/pages`, {
+            headers: {Accept:'application/vnd.github+json', Authorization:`Bearer ${process.env.GH_TOKEN}`, 'X-GitHub-Api-Version':'2022-11-28'}
+          });
+          if (r.status !== 404 && !r.ok) throw new Error(`Pages activation check returned HTTP ${r.status}`);
+          const info = r.ok ? await r.json() : null;
+          const enabled = !!info && info.build_type === 'workflow';
+          appendFileSync(process.env.GITHUB_OUTPUT, `enabled=${enabled}\n`);
+          if (!enabled) {
+            const message = 'Site NOT live yet. Enable Settings → Pages → Source: GitHub Actions, then run this workflow again.';
+            console.log(`::notice::${message}`);
+            appendFileSync(process.env.GITHUB_STEP_SUMMARY, `## Publishing awaits activation\n\n${message}\n\n[Open Pages settings](https://github.com/${process.env.GITHUB_REPOSITORY}/settings/pages)\n`);
+          }
+          JS
       - name: Stage the single-file experience
+        if: steps.activation.outputs.enabled == 'true'
         run: |
           mkdir _site
           cp index.html _site/index.html
           touch _site/.nojekyll
       - name: Configure Pages
+        if: steps.activation.outputs.enabled == 'true'
         uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
+        if: steps.activation.outputs.enabled == 'true'
         with:
           path: _site
       - name: Deploy
+        if: steps.activation.outputs.enabled == 'true'
         id: deployment
         uses: actions/deploy-pages@v4
